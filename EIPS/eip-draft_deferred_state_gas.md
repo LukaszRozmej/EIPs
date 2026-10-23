@@ -58,7 +58,8 @@ The account-creation charge of a contract-creation transaction is undone by a ro
 - A state-gas charge listed in [EIP-8037](./eip-8037.md) adds its amount to `state_gas_used`. It does not change `gas_left`.
 - A state-gas refill listed in [EIP-8037](./eip-8037.md) subtracts its amount from `state_gas_used`. It does not change `gas_left`.
 - When a frame reverts or halts exceptionally, `state_gas_used` is set back to its value at the entry of the frame, together with the other state changes of the frame. The remaining `gas_left` of the frame is returned to the parent or consumed, as before [EIP-8037](./eip-8037.md).
-- If `state_gas_used` becomes greater than `state_gas_limit`, the transaction fails at once with a settlement failure.
+- If `state_gas_used` becomes greater than `state_gas_limit`, the transaction fails at once with a settlement failure. Execution stops: no further instruction is executed in any frame.
+- The account-creation charge of a `CALL*` that transfers value to a non-existent account is added when the transfer is made. If the target has no code, nothing in the call can undo the transfer, so an implementation can apply the charge without a child frame. The charge is still undone when a frame that contains the `CALL*` rolls back.
 
 The `GAS` opcode returns `gas_left`. The 63/64 rule of [EIP-150](./eip-150.md) and the `SSTORE` stipend check of [EIP-2200](./eip-2200.md) apply to `gas_left`, as before [EIP-8037](./eip-8037.md).
 
@@ -74,6 +75,8 @@ The execution-gas charge of a state-creating operation is not lower than the cos
 
 The constants `20000`, `25000` and `32000` are the values of `GAS_STORAGE_SET`, `GAS_NEW_ACCOUNT` and `GAS_CREATE` before [EIP-8037](./eip-8037.md). These charges are execution-gas. The code-deposit charge and the pre-execution charges are not changed.
 
+An `SSTORE` that restores a slot to an original value of zero (original value zero, current value non-zero, new value zero) adds `max(STORAGE_WRITE, 20000)` to the refund counter, instead of the `STORAGE_WRITE` of [EIP-8038](./eip-8038.md). Thus a slot that is set and cleared in the same transaction costs only its access, as before [EIP-8037](./eip-8037.md). The refund cap applies.
+
 ### Settlement
 
 When the top-level frame ends:
@@ -87,6 +90,8 @@ tx_gas_used_before_refund = intrinsic_gas + exec_gas_used + tx_state_gas
 ```
 
 A settlement failure is processed as an exceptional halt of the top-level frame: all state changes of the execution are rolled back, `gas_left` is consumed, the refund counter is set to zero and `state_gas_used` is set to zero. The [EIP-7702](./eip-7702.md) authorizations stay applied, and `committed_state_gas` stays charged. The receipt status is `0`.
+
+A settlement failure is not an out-of-gas condition of any frame. Clients SHOULD report it in traces as a failure of the top-level frame with its own error, for example `state gas settlement failed`.
 
 The refund cap, the [EIP-7623](./eip-7623.md) calldata floor, the receipt `cumulative_gas_used` and the block-level accounting apply as in [EIP-8037](./eip-8037.md), with `tx_state_gas` from above. The unused part of `tx.gas` is returned to the sender.
 
@@ -130,6 +135,17 @@ The floor increases the total cost of a new slot by 10,000 gas (about 9%) compar
 
 `state_gas_used` is paid only at the end. Without a bound, a transaction could hold much more unpaid new state during execution than it can pay for, for example by deploying large contracts with little execution-gas. The check against `state_gas_limit` limits this to what `tx.gas` could pay for if the execution used no gas, which is the same limit as with the reservoir. The check uses a value that is fixed for the transaction, so it is simple to compute at every charge. The exact check is done at settlement.
 
+Execution stops at once when the check fails. Execution that continued could not change the result, because the transaction fails and `gas_left` is consumed in both cases. But it would access more accounts and slots, and these accesses would enter the [EIP-7928](./eip-7928.md) block access list. Stopping at once makes the block access list of a failed transaction unambiguous.
+
+### `gas_left` includes gas that settlement can need
+
+Under [EIP-8037](./eip-8037.md), a state-gas charge without a reservoir lowers `gas_left` at once. With this proposal, `gas_left` is not lowered, and the gas stays available for execution until settlement. Two effects follow:
+
+- `GAS` returns more than under [EIP-8037](./eip-8037.md) after state creation, and a transaction with `tx.gas <= TX_MAX_GAS_LIMIT` cannot have a small `gas_left` and a state budget at the same time.
+- A frame that forwards all its gas forwards gas that settlement can need later. For example, a child `CREATE` that fails consumes 63/64 of a `gas_left` that the account-creation charge did not lower, so it consumes about 63/64 of `STATE_BYTES_PER_NEW_ACCOUNT × CPSB` more gas than under [EIP-8037](./eip-8037.md).
+
+Both effects match the gas semantics before [EIP-8037](./eip-8037.md), where all gas was available for execution. A sender who wants a frame to keep gas for settlement must supply it in `tx.gas`.
+
 ### Authorizations are paid before execution
 
 [EIP-7702](./eip-7702.md) authorizations stay applied when execution fails. Their state-gas must therefore be paid even if settlement fails, so it is taken from `tx.gas` before `gas_left` is set.
@@ -145,6 +161,7 @@ This is a backwards-incompatible change of the gas model that requires a schedul
 - `GAS` and the forwarding of gas to calls behave as before [EIP-8037](./eip-8037.md). The difference between two `GAS` reads is never negative.
 - `gasleft()` differences do not include state-gas. Contracts that use them to charge a user for the work of a sub-call, for example the [ERC-4337](./eip-4337.md) `EntryPoint`, do not charge for state-gas. This is the same as for state-gas taken from the reservoir under [EIP-8037](./eip-8037.md), and similar to fees that rollups charge outside of gas.
 - A transaction can fail at settlement after its execution completed. Wallets must use `eth_estimateGas`, which includes the settlement.
+- `GAS` returns more than under [EIP-8037](./eip-8037.md) after state creation, and a frame that forwards all its gas forwards gas that settlement can need (see [`gas_left` includes gas that settlement can need](#gas_left-includes-gas-that-settlement-can-need)).
 
 ## Security Considerations
 
