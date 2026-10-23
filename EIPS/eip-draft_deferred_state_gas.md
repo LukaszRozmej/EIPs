@@ -8,12 +8,12 @@ status: Draft
 type: Standards Track
 category: Core
 created: 2026-10-23
-requires: 150, 2200, 2780, 7623, 7702, 7825, 8037, 8038
+requires: 150, 2200, 2780, 7623, 7702, 7825, 7928, 8037, 8038
 ---
 
 ## Abstract
 
-This proposal replaces the reservoir model of [EIP-8037](./eip-8037.md) with a single settlement at the end of the transaction. State-creating operations do not take state-gas from `gas_left`. They only increase a counter of the transaction's net state-gas, which is part of the state that a frame's rollback undoes. When execution ends, the counter is paid from the gas that execution did not use. If that gas is not sufficient, the transaction fails as a whole. The pricing (`CPSB`), the two-dimensional block accounting and the [EIP-7825](./eip-7825.md) cap on execution gas of [EIP-8037](./eip-8037.md) do not change. The execution-gas charge of each state-creating operation is not lower than its cost before [EIP-8037](./eip-8037.md).
+This proposal replaces the reservoir model of [EIP-8037](./eip-8037.md) with a single settlement at the end of the transaction. State-creating operations do not take state-gas from `gas_left`. They only increase a counter of the transaction's net state-gas, which is part of the state that a frame's rollback undoes. When execution ends, the counter is paid from the gas that execution did not use. If that gas is not sufficient, the transaction fails as a whole. A call frame can create net state-gas only up to an allowance derived from the gas forwarded to it, so a caller still limits what a callee can cost. A new `STATEGAS` opcode returns the net state-gas used so far. The pricing (`CPSB`), the two-dimensional block accounting and the [EIP-7825](./eip-7825.md) cap on execution gas of [EIP-8037](./eip-8037.md) do not change. The execution-gas charge of each state-creating operation is not lower than its cost before [EIP-8037](./eip-8037.md).
 
 ## Motivation
 
@@ -32,6 +32,16 @@ All three come from charging state-gas inside frames. The amount of state a tran
 The parameters and the state-gas amounts of [EIP-8037](./eip-8037.md) apply: `CPSB`, `STATE_BYTES_PER_STORAGE_SET`, `STATE_BYTES_PER_NEW_ACCOUNT`, `STATE_BYTES_PER_AUTH_BASE` and `TX_MAX_TOTAL_GAS_LIMIT`, and the operations listed in its sections "Gas accounting for SSTORE (opcode-level)" and "Gas accounting for new accounts". The transaction validity rules and the block-level accounting of [EIP-8037](./eip-8037.md) apply as specified there, with `tx_output.evm_state_gas_used` replaced by `tx_state_gas` below.
 
 This proposal replaces the section "Transaction-level gas accounting (reservoir model)" of [EIP-8037](./eip-8037.md), including its subsections on halts, reverts and successful children. `state_gas_reservoir`, `state_gas_from_gas_left`, `state_gas_baseline` and `state_gas_committed` are removed.
+
+### Parameters
+
+| Parameter | Value |
+|---|---|
+| `LEGACY_GAS_PER_STATE_BYTE` | 200 |
+| `STATEGAS` opcode | `0x4c` (provisional) |
+| `STATEGAS` gas cost | 2 |
+
+`LEGACY_GAS_PER_STATE_BYTE` is `GAS_CODE_DEPOSIT` before [EIP-8037](./eip-8037.md), the lowest gas per new state byte of any operation before [EIP-8037](./eip-8037.md).
 
 ### Pre-execution
 
@@ -62,6 +72,29 @@ The account-creation charge of a contract-creation transaction is undone by a ro
 - The account-creation charge of a `CALL*` that transfers value to a non-existent account is added when the transfer is made. If the target has no code, nothing in the call can undo the transfer, so an implementation can apply the charge without a child frame. The charge is still undone when a frame that contains the `CALL*` rolls back.
 
 The `GAS` opcode returns `gas_left`. The 63/64 rule of [EIP-150](./eip-150.md) and the `SSTORE` stipend check of [EIP-2200](./eip-2200.md) apply to `gas_left`, as before [EIP-8037](./eip-8037.md).
+
+### State-gas allowance of call frames
+
+Each call frame has a `state_gas_allowance` and records `state_gas_used_at_entry`, the value of `state_gas_used` when the frame starts. The net state-gas of a frame is `state_gas_used - state_gas_used_at_entry`. It includes the state-gas of its successful descendants and can be negative.
+
+- The top-level frame has no allowance. Only `state_gas_limit` applies to it.
+- A frame that a `CALL*`, `CREATE` or `CREATE2` starts with `child_gas` of `gas_left` (after the 63/64 rule and including the call stipend) gets:
+
+  ```python
+  parent_net_state_gas = state_gas_used - parent.state_gas_used_at_entry
+  child.state_gas_allowance = min(
+      parent.state_gas_allowance - parent_net_state_gas,  # no limit if the parent has none
+      child_gas * CPSB // LEGACY_GAS_PER_STATE_BYTE)
+  ```
+
+- After each state-gas charge, including the code-deposit charge of a create frame, the frame that is charged checks its net state-gas. If it is greater than its `state_gas_allowance`, the frame halts exceptionally, as on out-of-gas: its state changes are rolled back and its `gas_left` is consumed. The caller continues, and can detect the failure as for any failed call.
+- The account-creation charge of a `CALL*` with value and of a `CREATE`/`CREATE2` is charged to the calling frame, before the child frame starts. The code-deposit charge is charged to the create frame.
+
+The check against `state_gas_limit` is applied first. When both checks fail, the transaction fails.
+
+### `STATEGAS` opcode
+
+`STATEGAS` takes no input. It pushes `state_gas_used`, the net state-gas of the transaction so far, without `committed_state_gas`. It costs 2 gas. The value can decrease, because refills and rollbacks decrease `state_gas_used`.
 
 ### Execution-gas of state-creating operations
 
@@ -146,20 +179,43 @@ Under [EIP-8037](./eip-8037.md), a state-gas charge without a reservoir lowers `
 
 Both effects match the gas semantics before [EIP-8037](./eip-8037.md), where all gas was available for execution. A sender who wants a frame to keep gas for settlement must supply it in `tx.gas`.
 
+### State-gas allowance
+
+Before [EIP-8037](./eip-8037.md), the gas that a caller forwards limited everything that a callee could cost, including state: the cheapest new state byte cost `LEGACY_GAS_PER_STATE_BYTE` (200) gas, as code deposit. Contracts that call untrusted code rely on this. Without an allowance, settlement removes this limit: a callee can deploy a large contract for little execution-gas, and the debt can fail the whole transaction, which no caller can catch.
+
+The allowance restores the limit with the only input that deployed contracts give, the forwarded gas. A frame with `g` gas can create at most `g / LEGACY_GAS_PER_STATE_BYTE` new state bytes, which is what `g` gas could buy before [EIP-8037](./eip-8037.md). Thus:
+
+- The allowance never fails a call that the same gas could complete before [EIP-8037](./eip-8037.md). Gas budgets that were sufficient stay sufficient.
+- A callee can create at most about `7.65 × g` of state-gas (`CPSB / 200`). A sender that executes untrusted code can make a settlement failure impossible: it sets `tx.gas` to at least the execution-gas plus `CPSB / LEGACY_GAS_PER_STATE_BYTE` times the gas it forwards to untrusted code. This needs only balance, because the unused gas is returned.
+- The allowance depends only on the forwarded gas. `tx.gas` does not change it, so the sender cannot use it to make a call fail that would succeed otherwise, beyond what the forwarded gas already allows.
+- When a frame exceeds its allowance, only that frame fails. The caller handles it as an out-of-gas of the callee.
+
+The child allowance is also limited by the parent's remaining allowance, so the net state-gas of a frame and all its descendants stays within the frame's allowance. Because the parent does not run while the child runs, only the frame that is charged must be checked.
+
+The allowance limits deployments from a call frame: a frame with 16.7M gas can deploy about 83 kB of code, as before [EIP-8037](./eip-8037.md). This is sufficient for a contract of the maximum size of [EIP-7954](./eip-7954.md). The top-level frame has no allowance, so a deployment from the transaction itself, or from a factory that the transaction calls directly, is limited only by `tx.gas`.
+
+A lower ratio, for example from the 312 gas per byte of a new slot before [EIP-8037](./eip-8037.md), would expose senders less. But it would fail deployments from call frames that the same gas could complete before [EIP-8037](./eip-8037.md).
+
+### `STATEGAS`
+
+`gasleft()` differences do not include state-gas, so contracts that bill a sub-call for its work, such as an [ERC-4337](./eip-4337.md) `EntryPoint`, cannot bill state-gas. `STATEGAS` lets new contracts measure it: the state-gas of a sub-call is the difference between two `STATEGAS` reads around it. The opcode exposes a value that the transaction already has. It does not change the cost or the result of any other operation.
+
 ### Authorizations are paid before execution
 
 [EIP-7702](./eip-7702.md) authorizations stay applied when execution fails. Their state-gas must therefore be paid even if settlement fails, so it is taken from `tx.gas` before `gas_left` is set.
 
 ### What is removed
 
-Compared with [EIP-8037](./eip-8037.md), this proposal removes the reservoir, the four frame-level counters, the last-in, first-out refill order, the merge step, the restore and commit rules, the partial reservoir of system calls, and the rule that the `GAS` opcode excludes the reservoir. It adds one journaled counter, a check at each state-gas charge against a fixed limit, and one check at the end of the transaction.
+Compared with [EIP-8037](./eip-8037.md), this proposal removes the reservoir, the four frame-level counters, the last-in, first-out refill order, the merge step, the restore and commit rules, the partial reservoir of system calls, and the rule that the `GAS` opcode excludes the reservoir. It adds one journaled counter, an allowance per frame, two checks at each state-gas charge, one check at the end of the transaction, and the `STATEGAS` opcode.
 
 ## Backwards Compatibility
 
 This is a backwards-incompatible change of the gas model that requires a scheduled network upgrade. It is intended to be activated together with [EIP-8037](./eip-8037.md), instead of the reservoir model.
 
 - `GAS` and the forwarding of gas to calls behave as before [EIP-8037](./eip-8037.md). The difference between two `GAS` reads is never negative.
-- `gasleft()` differences do not include state-gas. Contracts that use them to charge a user for the work of a sub-call, for example the [ERC-4337](./eip-4337.md) `EntryPoint`, do not charge for state-gas. This is the same as for state-gas taken from the reservoir under [EIP-8037](./eip-8037.md), and similar to fees that rollups charge outside of gas.
+- `gasleft()` differences do not include state-gas. Contracts that use them to charge a user for the work of a sub-call, for example the [ERC-4337](./eip-4337.md) `EntryPoint`, do not charge for state-gas. This is the same as for state-gas taken from the reservoir under [EIP-8037](./eip-8037.md), and similar to fees that rollups charge outside of gas. New contracts can use `STATEGAS`.
+- A call frame that creates more state than its forwarded gas could buy before [EIP-8037](./eip-8037.md) fails with an exceptional halt.
+- `STATEGAS` is a new opcode. `0x4c` was an undefined instruction before.
 - A transaction can fail at settlement after its execution completed. Wallets must use `eth_estimateGas`, which includes the settlement.
 - `GAS` returns more than under [EIP-8037](./eip-8037.md) after state creation, and a frame that forwards all its gas forwards gas that settlement can need (see [`gas_left` includes gas that settlement can need](#gas_left-includes-gas-that-settlement-can-need)).
 
@@ -167,13 +223,11 @@ This is a backwards-incompatible change of the gas model that requires a schedul
 
 ### Cost of untrusted code to the sender
 
-The gas that a caller forwards to a sub-call does not limit the state-gas that the sub-call can create. For slots and accounts, the execution-gas floor limits it to about 4 to 6 times the forwarded gas. For code deposit, it is not limited by the forwarded gas: a sub-call can deploy a large contract with little execution-gas. The sender pays for this state-gas, up to `tx.gas`. Senders that execute untrusted code, such as bundlers and relayers, must simulate the transaction and include its state-gas in what they charge, or set `tx.gas` so that a settlement failure is acceptable to them. Under [EIP-8037](./eip-8037.md) the same applies when the transaction has a reservoir.
+The allowance limits the state-gas that a sub-call can create to `CPSB / LEGACY_GAS_PER_STATE_BYTE` (about 7.65) times the gas forwarded to it. The sender pays for this state-gas. A contract that bills sub-calls by `gasleft()` differences, such as a deployed [ERC-4337](./eip-4337.md) `EntryPoint`, does not bill it. A bundler or relayer that uses such a contract must simulate the transaction and charge for the state-gas in another way, for example through `preVerificationGas`, or accept the cost. New contracts can bill it with `STATEGAS`. Under [EIP-8037](./eip-8037.md) the same applies when the transaction has a reservoir, without a limit per sub-call.
 
-### Untrusted code can fail the whole transaction
+### Untrusted code cannot fail the whole transaction
 
-Before this proposal, a sub-call with a limited gas budget cannot make the transaction of its caller fail: the sub-call runs out of gas, and the caller continues. With this proposal, a sub-call can create more state-gas than the transaction can pay, for example by deploying a large contract. The settlement then fails the whole transaction, and the caller cannot catch this. One bad user operation can make an [ERC-4337](./eip-4337.md) bundle fail, and the bundler pays for all of its execution-gas. Batch executors, keepers and relayers have the same problem. Under [EIP-8037](./eip-8037.md), the sub-call pays the state-gas from its own `gas_left` when the reservoir is exhausted, so only the sub-call runs out of gas.
-
-This is an open issue of this proposal. A solution must let a caller limit the state-gas of a sub-call. For deployed contracts, the only available input is the gas that the caller forwards.
+Without the allowance, a sub-call could create more state-gas than the transaction can pay, for example by deploying a large contract with little execution-gas. The settlement would then fail the whole transaction, and no caller could catch it: one bad user operation could make an [ERC-4337](./eip-4337.md) bundle fail. With the allowance, a sub-call that exceeds its limit fails alone, and its caller continues. A sender that sets `tx.gas` to at least its execution-gas plus `CPSB / LEGACY_GAS_PER_STATE_BYTE` times the gas forwarded to untrusted code cannot get a settlement failure from that code.
 
 ### Wasted execution
 
