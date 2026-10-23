@@ -59,7 +59,7 @@ state_gas_used = 0
 
 `committed_state_gas` is the state-gas of the pre-execution charges that a rollback of the top-level frame does not undo, which are the [EIP-7702](./eip-7702.md) authorization charges. It is paid before execution starts.
 
-The account-creation charge of a contract-creation transaction is undone by a rollback of the top-level frame. It is added to `state_gas_used` when the top-level frame starts.
+The account-creation charge of a contract-creation transaction is undone by a rollback of the top-level frame. It is added to `state_gas_used` when the top-level frame starts, before any init code runs, and the check against `state_gas_limit` below applies to it. Thus a contract-creation transaction to a non-existent address needs `tx.gas - intrinsic_gas - committed_state_gas >= STATE_BYTES_PER_NEW_ACCOUNT × CPSB`, or it fails with a settlement failure before its init code runs. The same applies to the account-creation charge of a transaction that transfers value to a non-existent account.
 
 ### State-gas during execution
 
@@ -88,13 +88,13 @@ Each call frame has a `state_gas_allowance` and records `state_gas_used_at_entry
   ```
 
 - After each state-gas charge, including the code-deposit charge of a create frame, the frame that is charged checks its net state-gas. If it is greater than its `state_gas_allowance`, the frame halts exceptionally, as on out-of-gas: its state changes are rolled back and its `gas_left` is consumed. The caller continues, and can detect the failure as for any failed call.
-- The account-creation charge of a `CALL*` with value and of a `CREATE`/`CREATE2` is charged to the calling frame, before the child frame starts. The code-deposit charge is charged to the create frame.
+- The account-creation charge of a `CALL*` with value and of a `CREATE`/`CREATE2` is charged to the calling frame, before the child frame starts. The code-deposit charge is charged to the create frame when its init code returns: it is checked against the net state-gas and the allowance of the create frame at that point. If the check fails, the code deposit fails, as when the create frame cannot pay the code-deposit cost.
 
 The check against `state_gas_limit` is applied first. When both checks fail, the transaction fails.
 
 ### `STATEGAS` opcode
 
-`STATEGAS` takes no input. It pushes `state_gas_used`, the net state-gas of the transaction so far, without `committed_state_gas`. It costs 2 gas. The value can decrease, because refills and rollbacks decrease `state_gas_used`.
+`STATEGAS` takes no input. It pushes `state_gas_used`, the net state-gas of the transaction so far, without `committed_state_gas`. It costs 2 gas. The value can decrease, because refills and rollbacks decrease `state_gas_used`. In a contract-creation transaction, the value includes the account-creation charge of the transaction from the first instruction of the init code.
 
 ### Execution-gas of state-creating operations
 
@@ -124,7 +124,7 @@ tx_gas_used_before_refund = intrinsic_gas + exec_gas_used + tx_state_gas
 
 A settlement failure is processed as an exceptional halt of the top-level frame: all state changes of the execution are rolled back, `gas_left` is consumed, the refund counter is set to zero and `state_gas_used` is set to zero. The [EIP-7702](./eip-7702.md) authorizations stay applied, and `committed_state_gas` stays charged. The receipt status is `0`.
 
-A settlement failure is not an out-of-gas condition of any frame. Clients SHOULD report it in traces as a failure of the top-level frame with its own error, for example `state gas settlement failed`.
+A settlement failure is not an out-of-gas condition of any frame. Clients SHOULD report it in traces with its own error, for example `state gas settlement failed`, at every level: on the instruction whose charge exceeds `state_gas_limit`, on each frame that stops, and on the transaction. A failure at the end of the transaction is reported on the top-level frame and the transaction only.
 
 The refund cap, the [EIP-7623](./eip-7623.md) calldata floor, the receipt `cumulative_gas_used` and the block-level accounting apply as in [EIP-8037](./eip-8037.md), with `tx_state_gas` from above. The unused part of `tx.gas` is returned to the sender.
 
