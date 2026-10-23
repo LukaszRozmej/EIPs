@@ -128,6 +128,30 @@ A settlement failure is not an out-of-gas condition of any frame. Clients SHOULD
 
 The refund cap, the [EIP-7623](./eip-7623.md) calldata floor, the receipt `cumulative_gas_used` and the block-level accounting apply as in [EIP-8037](./eip-8037.md), with `tx_state_gas` from above. The unused part of `tx.gas` is returned to the sender.
 
+### Repricing surcharge (extension)
+
+This section is a separable extension. It applies the settlement to the execution-gas increases of [EIP-8038](./eip-8038.md), so that deployed contracts see no repricing inside call frames.
+
+A transaction-level counter `surcharge_used` starts at zero. It only increases: a revert or an exceptional halt does not decrease it, because the work was done.
+
+- Each charge to `gas_left` that [EIP-8038](./eip-8038.md) raises is charged at its value before [EIP-8038](./eip-8038.md), and the increase is added to `surcharge_used`. For example, the first change of an existing slot takes the access cost plus 2,800 from `gas_left` and adds `STORAGE_WRITE - 2800` to `surcharge_used`. A cold account access takes 2,600 and adds `COLD_ACCOUNT_ACCESS - 2600`. A `CALL` with value takes 9,000 and adds `CALL_VALUE - 9000`.
+- Charges that [EIP-8038](./eip-8038.md) lowers, and the state-creating operations of this proposal, are not changed by this section. Intrinsic gas and the refund counter use the values of [EIP-8038](./eip-8038.md) directly, because contracts cannot observe them during execution.
+- The check during execution becomes `state_gas_used + surcharge_used > state_gas_limit`.
+- Settlement charges `state_gas_used + surcharge_used`:
+
+  ```python
+  exec_gas_used = gas_left_initial - gas_left
+  settlement_gas = state_gas_used + surcharge_used
+  if settlement_gas > state_gas_limit - exec_gas_used:
+      settlement_failure()
+  tx_gas_used_before_refund = intrinsic_gas + exec_gas_used + surcharge_used + committed_state_gas + state_gas_used
+  ```
+
+- On a settlement failure, the sender pays `min(tx.gas, intrinsic_gas + committed_state_gas + gas_left_initial + surcharge_used)`.
+- `surcharge_used` is execution-gas in the block accounting, also when settlement fails: in that case, `tx_execution_gas = max(intrinsic_gas + gas_left_initial + surcharge_used, calldata_floor_gas_cost)`.
+- The transaction-validity check for the execution dimension becomes `min(TX_MAX_GAS_LIMIT, tx.gas) * 7 // 2 <= execution_gas_available`. A charge is raised at most 3.5 times, by the first change of a warm existing slot (2,900 before, 10,100 after), so this is the most execution-gas a transaction can add to the block.
+- `STATEGAS` returns `state_gas_used + surcharge_used`, the gas that settlement will charge so far.
+
 ### System calls
 
 System calls get `30_000_000` `gas_left` and no settlement. Their state-gas is not limited and does not count toward the block. `SYSTEM_MAX_SSTORES_PER_CALL` is removed.
@@ -200,6 +224,15 @@ A lower ratio, for example from the 312 gas per byte of a new slot before [EIP-8
 
 `gasleft()` differences do not include state-gas, so contracts that bill a sub-call for its work, such as an [ERC-4337](./eip-4337.md) `EntryPoint`, cannot bill state-gas. `STATEGAS` lets new contracts measure it: the state-gas of a sub-call is the difference between two `STATEGAS` reads around it. The opcode exposes a value that the transaction already has. It does not change the cost or the result of any other operation.
 
+### Repricing surcharge
+
+A repricing that raises execution-gas can make a fixed gas budget of a deployed contract too small. For example, [EIP-8038](./eip-8038.md) raises the first change of a cold existing slot from 5,000 to 12,100, so an ERC-20 transfer to an existing holder costs about 14,200 more. Where a contract records such a failure permanently, the repricing causes a permanent loss. The surcharge keeps the costs inside call frames at their values before [EIP-8038](./eip-8038.md), and the sender still pays the new prices through settlement.
+
+- **Work per transaction.** `gas_left` is still capped at `TX_MAX_GAS_LIMIT - intrinsic_gas`, but in prices before [EIP-8038](./eip-8038.md). The most work that one transaction can do is therefore the same as before [EIP-8038](./eip-8038.md), up to 3.5 times `TX_MAX_GAS_LIMIT` in [EIP-8038](./eip-8038.md) prices for a transaction of only warm storage updates. The extension gives up the tighter limit per transaction that [EIP-8038](./eip-8038.md) would add. It keeps the limit per block: `surcharge_used` counts as execution-gas of the block.
+- **No allowance needed.** The surcharge of a charge is at most 2.5 times its value inside the frame. So the surcharge of a call frame is at most 2.5 times the gas it was given, and a sender can make settlement safe by its choice of `tx.gas`.
+- **Not undone by a rollback.** The surcharge pays for work that was done, so it stays when a frame reverts or halts, as consumed gas does.
+- **Future repricings.** The same rule can apply to later repricings, so that deployed contracts never see a repricing inside a call frame.
+
 ### Authorizations are paid before execution
 
 [EIP-7702](./eip-7702.md) authorizations stay applied when execution fails. Their state-gas must therefore be paid even if settlement fails, so it is taken from `tx.gas` before `gas_left` is set.
@@ -236,6 +269,17 @@ A transaction that fails at settlement pays for all of its execution-gas, as a t
 ### Unpaid state during execution
 
 The check against `state_gas_limit` limits the new state that a transaction can create during execution to the state that `tx.gas` could pay for.
+
+### Underpaid work of failed transactions (repricing surcharge)
+
+With the repricing surcharge, a transaction can do work whose surcharge it cannot pay: it uses all of `gas_left` on storage updates, and settlement fails. The sender then pays all of `tx.gas`, which covers the work at the prices before [EIP-8038](./eip-8038.md) but not at the new prices. The block still counts the full work, so the block limit is kept. But such a transaction raises the base fee by more than it pays for, by at most 3.5 times. The work and the price are the same as before [EIP-8038](./eip-8038.md), and the state changes of the transaction are rolled back.
+
+### Block building
+
+A builder learns the gas that a transaction uses only after it executes the transaction, as before this proposal. Settlement does not change this, and every included transaction pays, also when settlement fails. Two things change:
+
+- The validity check before execution must reserve the most that a transaction can use: `tx.gas` in the state dimension, as in [EIP-8037](./eip-8037.md), and, with the repricing surcharge, 3.5 times `min(TX_MAX_GAS_LIMIT, tx.gas)` in the execution dimension. Near the end of a block, a transaction can therefore be rejected although its actual use would fit. The loss is at most one reservation per block and dimension.
+- A transaction with a large `tx.gas` for state, such as a large deployment, needs that much free state capacity. It fits only in a block that has not used much state yet.
 
 ## Copyright
 
